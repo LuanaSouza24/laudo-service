@@ -3,26 +3,34 @@ import base64
 import tempfile
 import shutil
 import importlib
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 app = FastAPI()
+
+
+class ImageItem(BaseModel):
+    # Ex.: "Fotos_imovel_Images/cc84ffd0.Foto.190306.jpg"
+    path: str
+    # conteúdo do arquivo em base64
+    base64: str
 
 
 class Payload(BaseModel):
     id_vistoria: str
     excel_base64: str
     template_base64: Optional[str] = None
+    images: Optional[List[ImageItem]] = None
 
 
 @app.post("/generate")
 def generate(p: Payload):
     work = tempfile.mkdtemp(prefix="laudo_")
     try:
-        # Diretório temporário onde vamos montar Cautelar.xlsx, tamplete.docx e a saída
+        # Diretório temporário onde montaremos Cautelar.xlsx, tamplete.docx, imagens e saída
         os.environ["LAUDO_BASE_DIR"] = work
 
         # 1) Salvar o Excel
@@ -30,7 +38,7 @@ def generate(p: Payload):
         with open(excel_path, "wb") as f:
             f.write(base64.b64decode(p.excel_base64))
 
-        # 2) Salvar o template (preferir o enviado; senão usar o que está no repo)
+        # 2) Salvar o template (preferir o enviado; senão usar o do repositório)
         dst_template = os.path.join(work, "tamplete.docx")
         if p.template_base64:
             with open(dst_template, "wb") as f:
@@ -39,14 +47,23 @@ def generate(p: Payload):
             template_src = os.path.join(os.path.dirname(__file__), "tamplete.docx")
             shutil.copy(template_src, dst_template)
 
-        # 3) Importar o gerar_laudo APÓS setar LAUDO_BASE_DIR
+        # 3) Salvar imagens recebidas respeitando a estrutura de pastas (Fotos_imovel_Images/..., etc.)
+        if p.images:
+            for it in p.images:
+                rel = (it.path or "").lstrip("/").replace("\\", "/")
+                abs_path = os.path.join(work, rel)
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                with open(abs_path, "wb") as f:
+                    f.write(base64.b64decode(it.base64))
+
+        # 4) Importar o gerar_laudo APÓS setar LAUDO_BASE_DIR
         import gerar_laudo as gl
         importlib.reload(gl)  # garante que os paths globais respeitem o LAUDO_BASE_DIR
 
-        # 4) Gerar o laudo
+        # 5) Gerar o laudo
         gl.gerar_laudo(p.id_vistoria)
 
-        # 5) Ler o DOCX gerado
+        # 6) Ler o DOCX gerado
         out_dir = os.path.join(work, "saida")
         if not os.path.isdir(out_dir):
             raise HTTPException(500, f"Pasta de saída não encontrada: {out_dir}")
@@ -55,7 +72,6 @@ def generate(p: Payload):
         if not docx_files:
             raise HTTPException(500, "Laudo não foi gerado (nenhum .docx na pasta de saída).")
 
-        # pegar o mais recente
         docx_files.sort(key=lambda n: os.path.getmtime(os.path.join(out_dir, n)), reverse=True)
         filename = docx_files[0]
         out_path = os.path.join(out_dir, filename)
