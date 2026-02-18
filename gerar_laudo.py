@@ -6,13 +6,22 @@ from docx.shared import Cm
 from docx import Document
 
 # Diretório base: onde está este script
-BASE_DIR = os.getenv("LAUDO_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = None
+EXCEL_PATH = None
+TEMPLATE_PATH = None
+OUTPUT_DIR = None
 
-EXCEL_PATH = os.path.join(BASE_DIR, "Cautelar.xlsx")
-TEMPLATE_PATH = os.path.join(BASE_DIR, "tamplete.docx")
-OUTPUT_DIR = os.path.join(BASE_DIR, "saida")
+def refresh_paths(base_dir=None):
+    """Recalcula caminhos com base em LAUDO_BASE_DIR (útil no Render/Power Automate)."""
+    global BASE_DIR, EXCEL_PATH, TEMPLATE_PATH, OUTPUT_DIR
+    BASE_DIR = base_dir or os.getenv("LAUDO_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+    EXCEL_PATH = os.path.join(BASE_DIR, "Cautelar.xlsx")
+    TEMPLATE_PATH = os.path.join(BASE_DIR, "tamplete.docx")
+    OUTPUT_DIR = os.path.join(BASE_DIR, "saida")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Inicializa caminhos no carregamento do módulo
+refresh_paths()
 
 
 # ----------------- Funções utilitárias ----------------- #
@@ -64,6 +73,7 @@ def decimal_to_dms(value, is_lat=True):
 
 
 def carregar_planilhas():
+    refresh_paths()
     xls = pd.ExcelFile(EXCEL_PATH)
     vistoria = pd.read_excel(xls, "Vistoria")
     empreendimento = pd.read_excel(xls, "Empreendimento")
@@ -626,6 +636,7 @@ def postprocess_docx(out_path):
     remover_espacos_entre_tabelas_fotograficas(d)
     d.save(out_path)
 def gerar_laudo(id_vistoria):
+    refresh_paths()
     vistoria, empreendimento, indice_fotos, itens, sistemas, ocorrencias = carregar_planilhas()
 
     row_v = vistoria[vistoria["ID_Vistoria"] == id_vistoria]
