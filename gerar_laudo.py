@@ -6,22 +6,27 @@ from docx.shared import Cm
 from docx import Document
 
 # Diretório base: onde está este script
-BASE_DIR = None
-EXCEL_PATH = None
-TEMPLATE_PATH = None
-OUTPUT_DIR = None
+BASE_DIR = os.getenv("LAUDO_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
 
-def refresh_paths(base_dir=None):
-    """Recalcula caminhos com base em LAUDO_BASE_DIR (útil no Render/Power Automate)."""
+EXCEL_PATH = os.path.join(BASE_DIR, "Cautelar.xlsx")
+TEMPLATE_PATH = os.path.join(BASE_DIR, "tamplete.docx")
+OUTPUT_DIR = os.path.join(BASE_DIR, "saida")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- Ajuste para execução em nuvem (Render) ---
+def refresh_paths():
+    """Recalcula caminhos globais a partir do LAUDO_BASE_DIR (se definido)."""
     global BASE_DIR, EXCEL_PATH, TEMPLATE_PATH, OUTPUT_DIR
-    BASE_DIR = base_dir or os.getenv("LAUDO_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
+    BASE_DIR = os.getenv("LAUDO_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
     EXCEL_PATH = os.path.join(BASE_DIR, "Cautelar.xlsx")
     TEMPLATE_PATH = os.path.join(BASE_DIR, "tamplete.docx")
     OUTPUT_DIR = os.path.join(BASE_DIR, "saida")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Inicializa caminhos no carregamento do módulo
+# Garante que os paths iniciais estejam coerentes
 refresh_paths()
+
 
 
 # ----------------- Funções utilitárias ----------------- #
