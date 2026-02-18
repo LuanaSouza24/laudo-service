@@ -43,10 +43,13 @@ def generate(p: Payload):
 
         return JSONResponse({"filename": filename, "docx_base64": docx_b64})
 
-    except Exception as e:
-	import traceback
-    	print(traceback.format_exc())
-        raise HTTPException(500, f"Erro gerando laudo: {e}")
+		except Exception as e:
+		    import traceback
+ 		    print("=== ERRO NO /generate ===")
+  			print(traceback.format_exc())
+    		raise HTTPException(500, f"Erro gerando laudo: {e}")
+
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
