@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
-import gerar_laudo_v3 as gl
+import gerar_laudo as gl
 
 app = FastAPI()
 
