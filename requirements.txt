@@ -1,11 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-docx
 pandas
 openpyxl
 requests
 msal
 python-multipart
-uvicorn
 docxtpl
 Pillow
