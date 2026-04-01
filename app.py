@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import base64
 import tempfile
 import shutil
@@ -7,7 +8,6 @@ import importlib
 import uuid
 import time
 import threading
-from io import BytesIO
 from typing import Optional, List
 from urllib.parse import quote
 
@@ -19,25 +19,59 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# ============================================================
-# ARMAZENAMENTO DE JOBS (em memória)
-# Cada job tem: status, result, error, criado_em
-# ============================================================
-_jobs: dict = {}
+JOBS_FILE = "/tmp/laudo_jobs.json"
 _jobs_lock = threading.Lock()
+JOB_TTL_SEGUNDOS = 3600
 
-JOB_TTL_SEGUNDOS = 3600  # remove jobs com mais de 1 hora automaticamente
+
+def _ler_jobs() -> dict:
+    if not os.path.exists(JOBS_FILE):
+        return {}
+    try:
+        with open(JOBS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _salvar_jobs(jobs: dict):
+    try:
+        with open(JOBS_FILE, "w") as f:
+            json.dump(jobs, f)
+    except Exception as e:
+        print(f"[AVISO] Nao foi possivel salvar jobs: {e}")
+
+
+def _get_job(job_id: str) -> dict:
+    with _jobs_lock:
+        return _ler_jobs().get(job_id)
+
+
+def _set_job(job_id: str, dados: dict):
+    with _jobs_lock:
+        jobs = _ler_jobs()
+        jobs[job_id] = dados
+        _salvar_jobs(jobs)
+
+
+def _delete_job(job_id: str):
+    with _jobs_lock:
+        jobs = _ler_jobs()
+        jobs.pop(job_id, None)
+        _salvar_jobs(jobs)
 
 
 def _limpar_jobs_antigos():
     agora = time.time()
     with _jobs_lock:
-        expirados = [jid for jid, j in _jobs.items()
-                     if agora - j["criado_em"] > JOB_TTL_SEGUNDOS]
+        jobs = _ler_jobs()
+        expirados = [jid for jid, j in jobs.items()
+                     if agora - j.get("criado_em", 0) > JOB_TTL_SEGUNDOS]
         for jid in expirados:
-            del _jobs[jid]
-    if expirados:
-        print(f"[INFO] {len(expirados)} job(s) expirado(s) removido(s).")
+            del jobs[jid]
+        if expirados:
+            _salvar_jobs(jobs)
+            print(f"[INFO] {len(expirados)} job(s) expirado(s) removido(s).")
 
 
 class Payload(BaseModel):
@@ -48,10 +82,6 @@ class Payload(BaseModel):
 
 
 def normalizar_rel_path(path: str) -> str:
-    """
-    Normaliza o caminho relativo vindo do Power Automate / Excel script.
-    Remove barras invertidas, barras duplicadas e espacos laterais.
-    """
     if not path:
         return ""
     rel = str(path).strip().replace("\\", "/")
@@ -141,7 +171,7 @@ def preparar_template(work_dir: str, template_base64: Optional[str]) -> str:
     else:
         template_src = os.path.join(os.path.dirname(__file__), "tamplete.docx")
         if not os.path.exists(template_src):
-            raise Exception("Template nao enviado e arquivo tamplete.docx nao encontrado no repositorio.")
+            raise Exception("Template nao enviado e tamplete.docx nao encontrado no repositorio.")
         shutil.copy(template_src, dst_template)
     return dst_template
 
@@ -186,17 +216,15 @@ def gerar_laudo_no_modulo(id_vistoria: str):
     gl.gerar_laudo(id_vistoria)
 
 
-# ============================================================
-# PROCESSAMENTO EM BACKGROUND
-# Roda em thread separada para nao bloquear o Power Automate
-# ============================================================
-
 def _processar_job(job_id: str, p: Payload):
-    """Executa todo o processamento do laudo em background."""
     work = tempfile.mkdtemp(prefix="laudo_")
     try:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "running"
+        _set_job(job_id, {
+            "status": "running",
+            "result": None,
+            "error": None,
+            "criado_em": time.time()
+        })
 
         print(f"========== JOB {job_id} INICIADO ==========")
         print(f"[INFO] id_vistoria={p.id_vistoria}")
@@ -215,29 +243,30 @@ def _processar_job(job_id: str, p: Payload):
         with open(out_path, "rb") as f:
             docx_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "done"
-            _jobs[job_id]["result"] = {"filename": filename, "docx_base64": docx_b64}
+        _set_job(job_id, {
+            "status": "done",
+            "result": {"filename": filename, "docx_base64": docx_b64},
+            "error": None,
+            "criado_em": time.time()
+        })
 
         print(f"[INFO] JOB {job_id} CONCLUIDO: {filename}")
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
         print(f"=== ERRO NO JOB {job_id} ===")
-        print(tb)
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "error"
-            _jobs[job_id]["error"] = str(e)
+        print(traceback.format_exc())
+        _set_job(job_id, {
+            "status": "error",
+            "result": None,
+            "error": str(e),
+            "criado_em": time.time()
+        })
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
         _limpar_jobs_antigos()
 
-
-# ============================================================
-# ENDPOINTS
-# ============================================================
 
 @app.get("/health")
 def health():
@@ -246,20 +275,14 @@ def health():
 
 @app.post("/generate")
 def generate(p: Payload, background_tasks: BackgroundTasks):
-    """
-    Recebe os dados, dispara o processamento em background
-    e retorna imediatamente o job_id.
-    O Power Automate consulta /status/{job_id} ate receber "done".
-    """
     job_id = str(uuid.uuid4())
 
-    with _jobs_lock:
-        _jobs[job_id] = {
-            "status": "pending",
-            "result": None,
-            "error": None,
-            "criado_em": time.time(),
-        }
+    _set_job(job_id, {
+        "status": "pending",
+        "result": None,
+        "error": None,
+        "criado_em": time.time()
+    })
 
     background_tasks.add_task(_processar_job, job_id, p)
 
@@ -269,45 +292,25 @@ def generate(p: Payload, background_tasks: BackgroundTasks):
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    """
-    Retorna o status atual do job.
-    Valores possiveis: pending | running | done | error
-    """
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-
+    job = _get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job nao encontrado.")
-
     resposta = {"status": job["status"]}
     if job["status"] == "error":
         resposta["error"] = job["error"]
-
     return JSONResponse(resposta)
 
 
 @app.get("/result/{job_id}")
 def result(job_id: str):
-    """
-    Retorna o laudo gerado (filename + docx_base64).
-    So disponivel quando status = done.
-    Remove o job da memoria apos a entrega.
-    """
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-
+    job = _get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job nao encontrado.")
-
     if job["status"] != "done":
         raise HTTPException(
             status_code=400,
             detail=f"Job ainda nao concluido. Status atual: {job['status']}"
         )
-
     result_data = job["result"]
-
-    with _jobs_lock:
-        _jobs.pop(job_id, None)
-
+    _delete_job(job_id)
     return JSONResponse(result_data)
