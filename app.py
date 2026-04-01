@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import requests
 from PIL import Image
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -103,8 +103,10 @@ def montar_url_sharepoint(rel_path: str) -> str:
 def obter_headers_sharepoint() -> dict:
     token = os.getenv("SHAREPOINT_BEARER_TOKEN", "").strip()
     if not token:
-        raise Exception("Variavel de ambiente SHAREPOINT_BEARER_TOKEN nao configurada.")
-    return {"Authorization": f"Bearer {token}"}
+        raise Exception("Token do SharePoint nao disponivel. Verifique SHAREPOINT_BEARER_TOKEN.")
+    if not token.lower().startswith("bearer "):
+        token = f"Bearer {token}"
+    return {"Authorization": token}
 
 
 def baixar_arquivo_sharepoint(rel_path: str, destino_abs: str):
@@ -195,7 +197,7 @@ def extrair_image_paths_do_excel(excel_path: str) -> list:
 
 def preparar_imagens(work_dir: str, image_paths: Optional[List[str]]):
     if not image_paths:
-        print("[INFO] Nenhuma imagem recebida em image_paths.")
+        print("[INFO] Nenhuma imagem para baixar.")
         return
     total = len(image_paths)
     print(f"[INFO] Iniciando download de {total} imagem(ns).")
@@ -239,11 +241,20 @@ def gerar_laudo_no_modulo(id_vistoria: str):
 def _processar_job(job_id: str, p: Payload):
     work = tempfile.mkdtemp(prefix="laudo_")
     try:
+        job_atual = _get_job(job_id)
+        sp_token = job_atual.get("sp_token", "") if job_atual else ""
+        if sp_token:
+            os.environ["SHAREPOINT_BEARER_TOKEN"] = sp_token
+            print("[INFO] Token do SharePoint recebido via header.")
+        else:
+            print("[AVISO] Nenhum token do SharePoint recebido. Usando variavel de ambiente.")
+
         _set_job(job_id, {
             "status": "running",
             "result": None,
             "error": None,
-            "criado_em": time.time()
+            "criado_em": job_atual.get("criado_em", time.time()) if job_atual else time.time(),
+            "sp_token": sp_token
         })
 
         print(f"========== JOB {job_id} INICIADO ==========")
@@ -270,7 +281,8 @@ def _processar_job(job_id: str, p: Payload):
             "status": "done",
             "result": {"filename": filename, "docx_base64": docx_b64},
             "error": None,
-            "criado_em": time.time()
+            "criado_em": time.time(),
+            "sp_token": ""
         })
 
         print(f"[INFO] JOB {job_id} CONCLUIDO: {filename}")
@@ -283,7 +295,8 @@ def _processar_job(job_id: str, p: Payload):
             "status": "error",
             "result": None,
             "error": str(e),
-            "criado_em": time.time()
+            "criado_em": time.time(),
+            "sp_token": ""
         })
 
     finally:
@@ -297,14 +310,16 @@ def health():
 
 
 @app.post("/generate")
-def generate(p: Payload, background_tasks: BackgroundTasks):
+async def generate(p: Payload, background_tasks: BackgroundTasks, request: Request):
     job_id = str(uuid.uuid4())
+    sp_token = request.headers.get("x-sp-token", "")
 
     _set_job(job_id, {
         "status": "pending",
         "result": None,
         "error": None,
-        "criado_em": time.time()
+        "criado_em": time.time(),
+        "sp_token": sp_token
     })
 
     background_tasks.add_task(_processar_job, job_id, p)
