@@ -176,6 +176,23 @@ def preparar_template(work_dir: str, template_base64: Optional[str]) -> str:
     return dst_template
 
 
+def extrair_image_paths_do_excel(excel_path: str) -> list:
+    try:
+        import pandas as pd
+        df = pd.read_excel(excel_path, sheet_name="indice_fotos")
+        if "Foto" not in df.columns:
+            print("[AVISO] Coluna 'Foto' nao encontrada em indice_fotos.")
+            return []
+        paths = df["Foto"].dropna().astype(str).str.strip()
+        paths = [p for p in paths if p and p.lower() != "nan"]
+        unique = list(dict.fromkeys(paths))
+        print(f"[INFO] Extraidos {len(unique)} caminhos de imagem do Excel.")
+        return unique
+    except Exception as e:
+        print(f"[AVISO] Nao foi possivel extrair image_paths do Excel: {e}")
+        return []
+
+
 def preparar_imagens(work_dir: str, image_paths: Optional[List[str]]):
     if not image_paths:
         print("[INFO] Nenhuma imagem recebida em image_paths.")
@@ -189,9 +206,12 @@ def preparar_imagens(work_dir: str, image_paths: Optional[List[str]]):
             continue
         destino_abs = os.path.join(work_dir, rel)
         print(f"[INFO] [{i}/{total}] Baixando: {rel}")
-        baixar_arquivo_sharepoint(rel, destino_abs)
-        if eh_imagem(destino_abs):
-            comprimir_imagem_no_mesmo_arquivo(destino_abs)
+        try:
+            baixar_arquivo_sharepoint(rel, destino_abs)
+            if eh_imagem(destino_abs):
+                comprimir_imagem_no_mesmo_arquivo(destino_abs)
+        except Exception as e:
+            print(f"[AVISO] Falha ao baixar '{rel}': {e}")
     print("[INFO] Download/preparo de imagens concluido.")
 
 
@@ -228,13 +248,16 @@ def _processar_job(job_id: str, p: Payload):
 
         print(f"========== JOB {job_id} INICIADO ==========")
         print(f"[INFO] id_vistoria={p.id_vistoria}")
-        print(f"[INFO] image_paths={len(p.image_paths or [])}")
 
         os.environ["LAUDO_BASE_DIR"] = work
 
-        preparar_excel(work, p.excel_base64)
+        excel_path = preparar_excel(work, p.excel_base64)
         preparar_template(work, p.template_base64)
-        preparar_imagens(work, p.image_paths)
+
+        image_paths = p.image_paths if p.image_paths else extrair_image_paths_do_excel(excel_path)
+        print(f"[INFO] image_paths={len(image_paths)}")
+        preparar_imagens(work, image_paths)
+
         gerar_laudo_no_modulo(p.id_vistoria)
 
         out_path = localizar_docx_gerado(work)
