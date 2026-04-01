@@ -1,6 +1,8 @@
 import os
 import sys
+import tempfile
 import pandas as pd
+from PIL import Image
 from docxtpl import DocxTemplate, InlineImage
 from docx.shared import Cm
 from docx import Document
@@ -120,13 +122,63 @@ def encontrar_imagem(path_str):
     return None
 
 
+# ============================================================
+# COMPRESSÃO DE IMAGENS
+# Reduz o tamanho das fotos antes de inserir no Word,
+# evitando timeout no Render com laudos com muitas fotos.
+# ============================================================
+
+_temp_files = []        # rastreia temporários para limpeza
+MAX_IMG_WIDTH_PX = 1200 # largura máxima em pixels
+JPEG_QUALITY     = 72   # qualidade JPEG (0-100)
+
+
+def compress_image(path: str) -> str:
+    """
+    Redimensiona e comprime a imagem antes de inserir no Word.
+    Retorna o caminho de um arquivo temporário JPEG comprimido.
+    Se falhar, retorna o path original sem interromper o processo.
+    """
+    if not path or not os.path.exists(path):
+        return path
+    try:
+        with Image.open(path) as img:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            w, h = img.size
+            if w > MAX_IMG_WIDTH_PX:
+                ratio = MAX_IMG_WIDTH_PX / w
+                img = img.resize((MAX_IMG_WIDTH_PX, int(h * ratio)), Image.LANCZOS)
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp.close()
+            img.save(tmp.name, "JPEG", quality=JPEG_QUALITY, optimize=True)
+            _temp_files.append(tmp.name)
+            return tmp.name
+    except Exception as e:
+        print(f"[AVISO] Nao foi possivel comprimir imagem {path}: {e}")
+        return path
+
+
+def cleanup_temp_files():
+    """Remove os arquivos temporarios de imagens comprimidas apos geracao do laudo."""
+    for f in _temp_files:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+    _temp_files.clear()
+
+
 def inline_image(doc, path, width_cm):
     """
     Cria um InlineImage com largura fixa em cm e altura proporcional.
+    APLICA COMPRESSAO automatica antes de inserir no documento.
     """
     if not path:
         return ""
-    return InlineImage(doc, path, width=Cm(width_cm))
+    compressed = compress_image(path)   # comprime antes de inserir
+    return InlineImage(doc, compressed, width=Cm(width_cm))
 
 
 def atribuir_figuras(indice_fotos, itens, sistemas, ocorrencias, id_vistoria, id_emp, inicio=4):
@@ -421,12 +473,13 @@ def montar_ambientes(indice_fotos, itens, sistemas, ocorrencias, id_vistoria):
         for _, sis_row in sis_amb.iterrows():
             id_sis = sis_row["ID_Sistema"]
 
-            elemento = safe_str(sis_row.get("Elemento", "")).strip()
+            elemento = safe_str(sis_row.get("Elemento_Nome", sis_row.get("Elemento", ""))).strip()
+
             # Regra pedida: se a 1ª coluna estiver vazia, a linha inteira deve ser removida
             if not elemento:
                 continue
 
-            acabamento = safe_str(sis_row.get("Acabamento", "")).strip()
+            acabamento = safe_str(sis_row.get("Acabamento_Nome", sis_row.get("Acabamento", ""))).strip()
             conservacao = safe_str(sis_row.get("Conservacao", "")).strip()
 
             occ_sis = ocorrencias[ocorrencias["ID_Sistema"] == id_sis]
@@ -640,6 +693,7 @@ def postprocess_docx(out_path):
     remover_linhas_vazias_tabelas_vistoria(d)
     remover_espacos_entre_tabelas_fotograficas(d)
     d.save(out_path)
+
 def gerar_laudo(id_vistoria):
     refresh_paths()
     vistoria, empreendimento, indice_fotos, itens, sistemas, ocorrencias = carregar_planilhas()
@@ -700,11 +754,10 @@ def gerar_laudo(id_vistoria):
         # Empreendimento
         "Contratante": get_ci(row_emp, "Contratante") or get_ci(row_v, "Contratante"),
         "Representante": get_ci(row_emp, "Representante") or get_ci(row_v, "Representante"),
-	"Setor": get_ci(row_emp, "Setor") or get_ci(row_v, "Setor"),
+        "Setor": get_ci(row_emp, "Setor") or get_ci(row_v, "Setor"),
         "Empreendimento": get_ci(row_emp, "Empreendimento") or get_ci(row_v, "Empreendimento"),
         "Endereço": get_ci(row_emp, "Endereço") or get_ci(row_v, "Endereço"),
         "ART": get_ci(row_emp, "ART") or get_ci(row_v, "ART"),
-	
 
         # Identificação imóvel / vistoria
         "Endereco_imovel": get_ci(row_v, "Endereco_imovel"),
@@ -776,6 +829,9 @@ def gerar_laudo(id_vistoria):
 
     # Limpeza: remove parágrafos vazios entre as tabelas do item 10 (Relatório Fotográfico)
     postprocess_docx(out_path)
+
+    # Limpeza dos arquivos temporarios de imagens comprimidas
+    cleanup_temp_files()
 
     print(f"[OK] Laudo gerado em: {out_path}")
 
