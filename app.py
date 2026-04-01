@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import requests
 from PIL import Image
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -23,6 +23,8 @@ JOBS_FILE = "/tmp/laudo_jobs.json"
 _jobs_lock = threading.Lock()
 JOB_TTL_SEGUNDOS = 3600
 
+
+# ─────────────────────── Jobs ───────────────────────
 
 def _ler_jobs() -> dict:
     if not os.path.exists(JOBS_FILE):
@@ -74,12 +76,7 @@ def _limpar_jobs_antigos():
             print(f"[INFO] {len(expirados)} job(s) expirado(s) removido(s).")
 
 
-class Payload(BaseModel):
-    id_vistoria: str
-    excel_base64: str
-    template_base64: Optional[str] = None
-    image_paths: Optional[List[str]] = None
-
+# ─────────────────────── Utilitários ───────────────────────
 
 def normalizar_rel_path(path: str) -> str:
     if not path:
@@ -90,52 +87,16 @@ def normalizar_rel_path(path: str) -> str:
     return rel
 
 
-def montar_url_sharepoint(rel_path: str) -> str:
-    base_url = os.getenv("SHAREPOINT_BASE_URL", "").strip().rstrip("/")
-    if not base_url:
-        raise Exception("Variavel de ambiente SHAREPOINT_BASE_URL nao configurada.")
-    rel = normalizar_rel_path(rel_path)
-    if not rel:
-        raise Exception("Caminho da imagem vazio ao montar URL do SharePoint.")
-    return f"{base_url}/{quote(rel, safe='/:()_- ')}"
-
-
-def obter_headers_sharepoint() -> dict:
-    token = os.getenv("SHAREPOINT_BEARER_TOKEN", "").strip()
-    if not token:
-        raise Exception("Token do SharePoint nao disponivel. Verifique SHAREPOINT_BEARER_TOKEN.")
-    if not token.lower().startswith("bearer "):
-        token = f"Bearer {token}"
-    return {"Authorization": token}
-
-
-def baixar_arquivo_sharepoint(rel_path: str, destino_abs: str):
-    url = montar_url_sharepoint(rel_path)
-    headers = obter_headers_sharepoint()
-    resp = requests.get(url, headers=headers, stream=True, timeout=180)
-    if resp.status_code != 200:
-        raise Exception(
-            f"Erro ao baixar arquivo do SharePoint. "
-            f"Status={resp.status_code}, path={rel_path}, url={url}"
-        )
-    os.makedirs(os.path.dirname(destino_abs), exist_ok=True)
-    with open(destino_abs, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
-
 def eh_imagem(caminho: str) -> bool:
     ext = os.path.splitext(caminho)[1].lower()
     return ext in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def comprimir_imagem_no_mesmo_arquivo(caminho: str, max_lado: int = 1600, qualidade: int = 75):
-    if not os.path.exists(caminho):
-        return
-    if not eh_imagem(caminho):
+    if not os.path.exists(caminho) or not eh_imagem(caminho):
         return
     try:
+        novo_caminho = caminho
         with Image.open(caminho) as img:
             img.thumbnail((max_lado, max_lado))
             if img.mode in ("RGBA", "LA", "P"):
@@ -178,45 +139,6 @@ def preparar_template(work_dir: str, template_base64: Optional[str]) -> str:
     return dst_template
 
 
-def extrair_image_paths_do_excel(excel_path: str) -> list:
-    try:
-        import pandas as pd
-        df = pd.read_excel(excel_path, sheet_name="indice_fotos")
-        if "Foto" not in df.columns:
-            print("[AVISO] Coluna 'Foto' nao encontrada em indice_fotos.")
-            return []
-        paths = df["Foto"].dropna().astype(str).str.strip()
-        paths = [p for p in paths if p and p.lower() != "nan"]
-        unique = list(dict.fromkeys(paths))
-        print(f"[INFO] Extraidos {len(unique)} caminhos de imagem do Excel.")
-        return unique
-    except Exception as e:
-        print(f"[AVISO] Nao foi possivel extrair image_paths do Excel: {e}")
-        return []
-
-
-def preparar_imagens(work_dir: str, image_paths: Optional[List[str]]):
-    if not image_paths:
-        print("[INFO] Nenhuma imagem para baixar.")
-        return
-    total = len(image_paths)
-    print(f"[INFO] Iniciando download de {total} imagem(ns).")
-    for i, original_path in enumerate(image_paths, start=1):
-        rel = normalizar_rel_path(original_path)
-        if not rel:
-            print(f"[AVISO] Caminho vazio ignorado no indice {i}.")
-            continue
-        destino_abs = os.path.join(work_dir, rel)
-        print(f"[INFO] [{i}/{total}] Baixando: {rel}")
-        try:
-            baixar_arquivo_sharepoint(rel, destino_abs)
-            if eh_imagem(destino_abs):
-                comprimir_imagem_no_mesmo_arquivo(destino_abs)
-        except Exception as e:
-            print(f"[AVISO] Falha ao baixar '{rel}': {e}")
-    print("[INFO] Download/preparo de imagens concluido.")
-
-
 def localizar_docx_gerado(work_dir: str) -> str:
     out_dir = os.path.join(work_dir, "saida")
     if not os.path.isdir(out_dir):
@@ -238,38 +160,27 @@ def gerar_laudo_no_modulo(id_vistoria: str):
     gl.gerar_laudo(id_vistoria)
 
 
-def _processar_job(job_id: str, p: Payload):
-    work = tempfile.mkdtemp(prefix="laudo_")
+# ─────────────────────── Processamento ───────────────────────
+
+def _processar_job_v2(job_id: str):
+    job = _get_job(job_id)
+    if not job:
+        print(f"[ERRO] Job {job_id} nao encontrado para processar.")
+        return
+
+    work = job.get("work_dir", "")
     try:
-        job_atual = _get_job(job_id)
-        sp_token = job_atual.get("sp_token", "") if job_atual else ""
-        if sp_token:
-            os.environ["SHAREPOINT_BEARER_TOKEN"] = sp_token
-            print("[INFO] Token do SharePoint recebido via header.")
-        else:
-            print("[AVISO] Nenhum token do SharePoint recebido. Usando variavel de ambiente.")
+        _set_job(job_id, {**job, "status": "running"})
 
-        _set_job(job_id, {
-            "status": "running",
-            "result": None,
-            "error": None,
-            "criado_em": job_atual.get("criado_em", time.time()) if job_atual else time.time(),
-            "sp_token": sp_token
-        })
-
-        print(f"========== JOB {job_id} INICIADO ==========")
-        print(f"[INFO] id_vistoria={p.id_vistoria}")
+        print(f"========== JOB {job_id} GERANDO ==========")
+        print(f"[INFO] id_vistoria={job['id_vistoria']}")
 
         os.environ["LAUDO_BASE_DIR"] = work
 
-        excel_path = preparar_excel(work, p.excel_base64)
-        preparar_template(work, p.template_base64)
+        preparar_excel(work, job["excel_base64"])
+        preparar_template(work, job.get("template_base64") or None)
 
-        image_paths = p.image_paths if p.image_paths else extrair_image_paths_do_excel(excel_path)
-        print(f"[INFO] image_paths={len(image_paths)}")
-        preparar_imagens(work, image_paths)
-
-        gerar_laudo_no_modulo(p.id_vistoria)
+        gerar_laudo_no_modulo(job["id_vistoria"])
 
         out_path = localizar_docx_gerado(work)
         filename = os.path.basename(out_path)
@@ -281,55 +192,118 @@ def _processar_job(job_id: str, p: Payload):
             "status": "done",
             "result": {"filename": filename, "docx_base64": docx_b64},
             "error": None,
-            "criado_em": time.time(),
-            "sp_token": ""
+            "criado_em": job.get("criado_em", time.time()),
+            "work_dir": "",
+            "id_vistoria": job["id_vistoria"],
+            "excel_base64": "",
+            "template_base64": ""
         })
-
         print(f"[INFO] JOB {job_id} CONCLUIDO: {filename}")
 
     except Exception as e:
         import traceback
         print(f"=== ERRO NO JOB {job_id} ===")
         print(traceback.format_exc())
-        _set_job(job_id, {
-            "status": "error",
-            "result": None,
-            "error": str(e),
-            "criado_em": time.time(),
-            "sp_token": ""
-        })
+        _set_job(job_id, {**job, "status": "error", "error": str(e)})
 
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if work and os.path.isdir(work):
+            shutil.rmtree(work, ignore_errors=True)
         _limpar_jobs_antigos()
 
+
+# ─────────────────────── Models ───────────────────────
+
+class PayloadIniciar(BaseModel):
+    id_vistoria: str
+    excel_base64: str
+    template_base64: Optional[str] = None
+
+
+class PayloadFoto(BaseModel):
+    path: str
+    b64: str
+
+
+# ─────────────────────── Endpoints ───────────────────────
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/generate")
-async def generate(p: Payload, background_tasks: BackgroundTasks, request: Request):
+@app.post("/iniciar")
+async def iniciar(p: PayloadIniciar):
+    """Cria o job e reserva diretório de trabalho. Retorna job_id."""
     job_id = str(uuid.uuid4())
-    sp_token = request.headers.get("x-sp-token", "")
+    work = tempfile.mkdtemp(prefix="laudo_")
 
     _set_job(job_id, {
-        "status": "pending",
+        "status": "aguardando_fotos",
+        "work_dir": work,
+        "id_vistoria": p.id_vistoria,
+        "excel_base64": p.excel_base64,
+        "template_base64": p.template_base64 or "",
         "result": None,
         "error": None,
-        "criado_em": time.time(),
-        "sp_token": sp_token
+        "criado_em": time.time()
     })
 
-    background_tasks.add_task(_processar_job, job_id, p)
-
-    print(f"[INFO] Job criado: {job_id} para vistoria {p.id_vistoria}")
+    print(f"[INFO] Job iniciado: {job_id} | vistoria={p.id_vistoria}")
     return JSONResponse({"job_id": job_id}, status_code=202)
+
+
+@app.post("/foto/{job_id}")
+async def receber_foto(job_id: str, p: PayloadFoto):
+    """Recebe uma foto por vez (base64) e salva no diretório do job."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nao encontrado.")
+
+    work = job.get("work_dir", "")
+    if not work or not os.path.isdir(work):
+        raise HTTPException(status_code=400, detail="Diretorio de trabalho invalido ou expirado.")
+
+    rel = normalizar_rel_path(p.path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="Campo 'path' invalido ou vazio.")
+    if not p.b64:
+        raise HTTPException(status_code=400, detail="Campo 'b64' invalido ou vazio.")
+
+    destino = os.path.join(work, rel)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+
+    with open(destino, "wb") as f:
+        f.write(base64.b64decode(p.b64))
+
+    if eh_imagem(destino):
+        comprimir_imagem_no_mesmo_arquivo(destino)
+
+    print(f"[INFO] Foto salva: {rel}")
+    return JSONResponse({"ok": True, "path": rel})
+
+
+@app.post("/gerar/{job_id}")
+async def gerar(job_id: str, background_tasks: BackgroundTasks):
+    """Dispara a geração do laudo após todas as fotos terem sido enviadas."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nao encontrado.")
+
+    if job.get("status") not in ("aguardando_fotos", "pending"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job em status inesperado: {job.get('status')}. Esperado: aguardando_fotos."
+        )
+
+    background_tasks.add_task(_processar_job_v2, job_id)
+    print(f"[INFO] Geracao disparada para job {job_id}")
+    return JSONResponse({"ok": True, "job_id": job_id}, status_code=202)
 
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
+    """Retorna o status atual do job."""
     job = _get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job nao encontrado.")
@@ -341,6 +315,7 @@ def status(job_id: str):
 
 @app.get("/result/{job_id}")
 def result(job_id: str):
+    """Retorna o laudo gerado em base64 e remove o job."""
     job = _get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job nao encontrado.")
